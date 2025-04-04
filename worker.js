@@ -15,7 +15,7 @@ export default {
     if (url.pathname === config.TRIGGER_PATH) {
       try {
         const result = await runCheckin();
-        await sendTelegramNotification(`✅ 夸克签到成功\n${result}`);
+        await sendTelegramNotification(`✅ 夸克签到完成\n${result}`);
         return successResponse(result);
       } catch (error) {
         await sendTelegramNotification(`❌ 夸克签到失败\n${error.message}`);
@@ -37,7 +37,7 @@ export default {
     await initializeConfig(env);
     try {
       const result = await runCheckin();
-      await sendTelegramNotification(`✅ 夸克自动签到成功\n${result}`);
+      await sendTelegramNotification(`✅ 夸克自动签到完成\n${result}`);
     } catch (error) {
       await sendTelegramNotification(`❌ 夸克自动签到失败\n${error.message}`);
     }
@@ -49,8 +49,15 @@ async function initializeConfig(env) {
     TRIGGER_PATH: env.TRIGGER_PATH || config.TRIGGER_PATH,
     TG_BOT_TOKEN: env.TG_BOT_TOKEN || config.TG_BOT_TOKEN,
     TG_CHAT_ID: env.TG_CHAT_ID || config.TG_CHAT_ID,
-    COOKIE_QUARK: env.COOKIE_QUARK ? env.COOKIE_QUARK.split(/&&|\n/) : config.COOKIE_QUARK
+    COOKIE_QUARK: env.COOKIE_QUARK ? 
+      env.COOKIE_QUARK.split(/\s*[&\n]+\s*/).filter(Boolean) : 
+      config.COOKIE_QUARK
   };
+
+  // 配置验证
+  if (config.COOKIE_QUARK.some(c => !c.includes('='))) {
+    throw new Error('存在无效的COOKIE_QUARK格式');
+  }
 }
 
 async function runCheckin() {
@@ -60,19 +67,30 @@ async function runCheckin() {
 
   let results = [];
   for (const cookie of config.COOKIE_QUARK) {
-    const userData = parseCookie(cookie);
-    const result = await quarkSign(userData);
-    results.push(result);
+    try {
+      const userData = parseCookie(cookie);
+      const result = await withRetry(() => quarkSign(userData), 3);
+      results.push(result);
+    } catch (error) {
+      results.push(`❌ ${maskString(userData?.user || '未知用户')} 签到失败: ${error.message}`);
+    }
   }
   return results.join('\n\n');
 }
 
 function parseCookie(cookie) {
-  return Object.fromEntries(
-    cookie.split(';')
+  try {
+    const entries = cookie
+      .split(';')
       .map(p => p.trim().split('='))
-      .filter(p => p.length === 2)
-  );
+      .filter(p => p.length === 2 && p.every(v => v.length > 0));
+    
+    if (entries.length === 0) throw new Error('无效Cookie格式');
+    
+    return Object.fromEntries(entries);
+  } catch (e) {
+    throw new Error(`Cookie解析失败: ${e.message}`);
+  }
 }
 
 async function quarkSign(userData) {
@@ -85,24 +103,29 @@ async function quarkSign(userData) {
       ...userData
     });
 
-    const infoRes = await fetch(`${infoUrl}?${infoParams}`);
-    const infoData = await infoRes.json();
+    const infoRes = await fetch(`${infoUrl}?${infoParams}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      }
+    });
     
+    if (!infoRes.ok) throw new Error(`容量请求失败: ${infoRes.status}`);
+    const infoData = await infoRes.json();
     if (!infoData.data) throw new Error('获取容量信息失败');
 
     // 执行签到
     const signUrl = 'https://drive-m.quark.cn/1/clouddrive/capacity/growth/sign';
-    const signParams = new URLSearchParams(infoParams);
-    
     const signRes = await fetch(signUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Cookie': Object.entries(userData).map(([k,v]) => `${k}=${v}`).join('; ')
       },
       body: JSON.stringify({ sign_cyclic: true })
     });
     
+    if (!signRes.ok) throw new Error(`签到请求失败: ${signRes.status}`);
     const signData = await signRes.json();
     
     // 构建结果
@@ -119,18 +142,19 @@ async function quarkSign(userData) {
     return result;
   } catch (error) {
     console.error('夸克签到异常:', error);
-    return `❌ 签到异常: ${error.message}`;
+    throw error; // 抛出错误供上层处理
   }
 }
 
-function convertBytes(bytes) {
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let i = 0;
-  while (bytes >= 1024 && i < units.length - 1) {
-    bytes /= 1024;
-    i++;
+async function withRetry(fn, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (i === retries - 1) throw error;
+      await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+    }
   }
-  return `${bytes.toFixed(2)} ${units[i]}`;
 }
 
 async function sendTelegramNotification(message) {
@@ -143,7 +167,10 @@ async function sendTelegramNotification(message) {
 
   const payload = {
     chat_id: config.TG_CHAT_ID,
-    text: `🕒 执行时间: ${timeString}\n\n${message}`,
+    text: `🕒 执行时间: ${timeString}\n` +
+          `🌐 服务端: 夸克网盘\n` +
+          `📥 处理账户数: ${config.COOKIE_QUARK.length}\n\n` +
+          `${message.split('\n\n').map(m => `➖ ${m}`).join('\n\n')}`,
     parse_mode: 'HTML',
     disable_web_page_preview: true
   };
@@ -151,14 +178,25 @@ async function sendTelegramNotification(message) {
   const telegramAPI = `https://api.telegram.org/bot${config.TG_BOT_TOKEN}/sendMessage`;
   
   try {
-    await fetch(telegramAPI, {
+    const response = await fetch(telegramAPI, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
+    if (!response.ok) throw new Error(await response.text());
   } catch (error) {
     console.error('Telegram通知失败:', error);
   }
+}
+
+function convertBytes(bytes) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (bytes >= 1024 && i < units.length - 1) {
+    bytes /= 1024;
+    i++;
+  }
+  return `${bytes.toFixed(2)} ${units[i]}`;
 }
 
 function maskString(str, visibleStart = 2, visibleEnd = 2) {
